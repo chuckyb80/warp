@@ -26,6 +26,8 @@
 #   tools/fetch_weights.sh --dry-run          # preflight only, no download
 #   tools/fetch_weights.sh                    # start or resume
 #   tools/fetch_weights.sh --check            # verify what is on disk, no fetch
+#   tools/fetch_weights.sh --verify           # --check, then sha256 of every shard
+#                                             # against the Hub's LFS hash
 #   tools/fetch_weights.sh --repo moonshotai/Kimi-Linear --dest /data/kl
 #   tools/fetch_weights.sh --repo Qwen/Qwen3.8-Flash-Next \
 #       --revision de4b8e4d43b917e7706784d8bb445c9af86a3540 \
@@ -70,6 +72,7 @@ SMALL_BACKOFF="${SMALL_BACKOFF:-3}"
 MIN_FREE_GB="${MIN_FREE_GB:-40}"
 DRY=0
 CHECK_ONLY=0
+VERIFY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -79,6 +82,7 @@ while [ $# -gt 0 ]; do
         --jobs) JOBS="$2"; shift 2 ;;
         --dry-run) DRY=1; shift ;;
         --check) CHECK_ONLY=1; shift ;;
+        --verify) CHECK_ONLY=1; VERIFY=1; shift ;;
         -h|--help) sed -n '4,36p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -344,6 +348,7 @@ if [ "$CHECK_ONLY" = 1 ]; then
     log "--check: verifying sizes on disk against the remote"
     bad=0
     fixed=0
+    dropped=0
     while read -r f; do
         [ -f "$DEST/$f" ] || continue
         want=$(hcurl -sIL --max-time 60 "$RAW/$f" \
@@ -352,6 +357,17 @@ if [ "$CHECK_ONLY" = 1 ]; then
         if [ "$want" != "$got" ]; then
             log "  INCOMPLETE $f ($got / ${want:-?})"
             bad=$((bad + 1))
+            # The other direction of the repair below. A crash of the machine
+            # (or of a WSL VM) can keep the line in $STATE but lose the end of
+            # the file it vouches for: seen 2026-11-27, six shards listed as
+            # done and short on disk, and every later run skipped them, said
+            # ALL SHARDS COMPLETE and left --check failing for ever. The
+            # remote is the stronger evidence, so the ledger loses the entry
+            # and the next plain run resumes the shard.
+            if grep -qxF "$f" "$STATE" 2>/dev/null; then
+                grep -vxF "$f" "$STATE" > "$STATE.tmp"; mv "$STATE.tmp" "$STATE"
+                dropped=$((dropped + 1))
+            fi
         elif ! grep -qxF "$f" "$STATE" 2>/dev/null; then
             # It matches the remote and the state file does not say so.
             # The remote is the stronger evidence of the two, and this is
@@ -363,7 +379,49 @@ if [ "$CHECK_ONLY" = 1 ]; then
         fi
     done < "$DEST/.shards"
     log "--check done: $bad incomplete$([ "$fixed" -gt 0 ] && \
-        printf ', %s verified against the remote and recorded' "$fixed")"
+        printf ', %s verified against the remote and recorded' "$fixed")$([ "$dropped" -gt 0 ] && \
+        printf ', %s taken off %s so the next run resumes them' "$dropped" "${STATE##*/}")"
+    # --verify: the same crash also leaves files at the right SIZE with the
+    # wrong bytes (2026-11-27: 16 of 20 shards, zero-filled blocks where
+    # the lost writes were). Size cannot see that; the Hub's LFS sha256 can.
+    # A mismatch is renamed *.bad (kept for a look, never fed to convert.py)
+    # and dropped from $STATE, so the next plain run fetches it whole.
+    if [ "$VERIFY" = 1 ] && [ "$bad" = 0 ]; then
+        log "--verify: sha256 of every shard against the Hub (reads every byte)"
+        "$PY" - "$REPO" "$REVISION" "$DEST" "$STATE" > "$DEST/.verify.out" 2>&1 <<'PY'
+import concurrent.futures as cf, hashlib, json, os, sys, urllib.request
+repo, rev, dest, state = sys.argv[1:5]
+req = urllib.request.Request(f"https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true")
+if os.environ.get("HF_TOKEN"):
+    req.add_header("Authorization", "Bearer " + os.environ["HF_TOKEN"])
+want = {e["path"]: e["lfs"]["oid"] for e in json.load(urllib.request.urlopen(req, timeout=90))
+        if e.get("lfs") and os.path.exists(os.path.join(dest, e["path"]))}
+if not want:
+    print("  FAILED: the Hub listed no LFS hashes for files on disk"); sys.exit(2)
+def sha(p):
+    h = hashlib.sha256()
+    with open(os.path.join(dest, p), "rb") as f:
+        for b in iter(lambda: f.read(1 << 24), b""):
+            h.update(b)
+    return p, h.hexdigest()
+bad = []
+with cf.ThreadPoolExecutor(4) as ex:
+    for p, got in ex.map(sha, sorted(want)):
+        if got != want[p]:
+            bad.append(p)
+            os.replace(os.path.join(dest, p), os.path.join(dest, p + ".bad"))
+            print(f"  BAD sha256 {p}: renamed {p}.bad, will be fetched again")
+if bad and os.path.exists(state):
+    keep = [l for l in open(state).read().split("\n") if l.strip() and l.strip() not in bad]
+    open(state, "w").write("".join(l + "\n" for l in keep))
+print(f"  --verify done: {len(want) - len(bad)} / {len(want)} match the Hub")
+sys.exit(1 if bad else 0)
+PY
+        vrc=$?
+        tr -d '\r' < "$DEST/.verify.out" | while read -r l; do log "$l"; done
+        rm -f "$DEST/.verify.out"
+        [ "$vrc" = 0 ] || bad=1
+    fi
     rm -f "$DEST/.shards"
     exit $(( bad > 0 ))
 fi
@@ -389,6 +447,10 @@ fi
 cat > "$DEST/.worker.sh" <<WORKER
 #!/bin/bash
 f="\$1"
+# GNU xargs runs the command once with no argument when its input is empty
+# (every shard already recorded), and that call then retried a pull of ""
+# eight times with backoff, minutes of nothing. No name, nothing to do.
+[ -n "\$f" ] || exit 0
 dest="$DEST"; raw="$RAW"; state="$STATE"; log="$LOG"
 max_retry=$MAX_RETRY; min_free=$MIN_FREE_GB
 hcurl() {
