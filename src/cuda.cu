@@ -32,7 +32,15 @@
  *   WASTE_CUDA_MIN_KB=N      matvecs smaller than this stay on the CPU pool
  *                            (default 2048: below it the copy and launch
  *                            cost more than the work)
- *   WASTE_CUDA_CACHE_MB=N    device-resident weight cache, off by default
+ *   WASTE_CUDA_CACHE_MB=N    device-resident weight cache, off by default;
+ *                            clamped at start-up to what the device has free
+ *                            (less 256 MB), because another process — on the
+ *                            MSI, a llama.cpp server holding 7.6 of 8 GB — can
+ *                            own most of it, and a cache sized past that fails
+ *                            an allocation on every call
+ *   WASTE_CUDA_STATS=1       print the call / fallback / copy counters on
+ *                            stderr at exit; tests/cuda_forward.sh reads them
+ *                            to prove the device ran at all
  */
 
 #include <cuda_runtime.h>
@@ -113,6 +121,7 @@ static struct {
     cu_entry *cache; int ncache, capcache;
     size_t cache_bytes, cache_limit;
     unsigned long long tick;
+    int cache_full;          /* a cache cudaMalloc failed: stop trying until release */
     char name[300];          /* "CUDA (" + cudaDeviceProp.name (256 chars) + ")" */
 } g;
 
@@ -175,14 +184,17 @@ static const void *cu_upload(const void *host, size_t bytes, cu_buf *scratch)
             cu_entry *ne = (cu_entry *)realloc(g.cache, (size_t)nc * sizeof *ne);
             if (ne) { g.cache = ne; g.capcache = nc; }
         }
-        if (g.ncache < g.capcache && cudaMalloc(&d, bytes + 64) == cudaSuccess) {
+        if (!g.cache_full && g.ncache < g.capcache && cudaMalloc(&d, bytes + 64) == cudaSuccess) {
             if (cudaMemcpyAsync(d, host, bytes, cudaMemcpyHostToDevice, g.s) != cudaSuccess) { cudaFree(d); return NULL; }
             waste_cuda_bytes_h2d += bytes;
             g.cache[g.ncache++] = (cu_entry){ host, bytes, fp, d, ++g.tick };
             g.cache_bytes += bytes;
             return d;
         }
-        /* no room: fall through to the scratch copy */
+        /* no room: fall through to the scratch copy, and stop asking. With
+         * the device nearly full every later call would try the same
+         * allocation, fail, and pay for it before copying anyway. */
+        if (!d) { g.cache_full = 1; cudaGetLastError(); }
     }
     void *d = cu_scratch(scratch, bytes);
     if (!d) return NULL;
@@ -227,7 +239,10 @@ static void mvq_rows_f32_cuda(int b, int e, void *p)
     mvq_kernel<<<blocks, threads, 0, g.s>>>(dY, (const uint8_t *)dW, (const uint16_t *)dS, dX,
                                             a->in, a->ng, a->group, a->bits,
                                             (unsigned long long)a->rowbytes, e);
-    cudaError_t err = cudaMemcpyAsync(a->y, dY, (size_t)e * sizeof(float), cudaMemcpyDeviceToHost, g.s);
+    /* A bad launch is reported here, not by the copy after it; checking it
+     * separately keeps the message about the kernel, not about a memcpy. */
+    cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess) err = cudaMemcpyAsync(a->y, dY, (size_t)e * sizeof(float), cudaMemcpyDeviceToHost, g.s);
     if (err == cudaSuccess) err = cudaStreamSynchronize(g.s);
     waste_cuda_n_calls++;
     pthread_mutex_unlock(&g_mu);
@@ -235,6 +250,12 @@ static void mvq_rows_f32_cuda(int b, int e, void *p)
         fprintf(stderr, "waste: CUDA matvec failed (%s); this call ran on the CPU\n", cudaGetErrorString(err));
         cu_cpu(b, e, p);
     }
+}
+
+static void cu_stats(void)
+{
+    fprintf(stderr, "waste: CUDA stats: %llu device calls, %llu CPU fallbacks, %.1f MB copied, %llu cache hits\n",
+            waste_cuda_n_calls, waste_cuda_n_fallback, waste_cuda_bytes_h2d / 1048576.0, waste_cuda_cache_hits);
 }
 
 const char *waste_register_cuda(waste_kernels *t)
@@ -255,6 +276,18 @@ const char *waste_register_cuda(waste_kernels *t)
                 snprintf(g.name, sizeof g.name, "CUDA (%s)", pr.name);
                 const char *c = getenv("WASTE_CUDA_CACHE_MB");
                 g.cache_limit = (size_t)(c ? atoll(c) : 0) << 20;
+                size_t fr = 0, tot = 0;
+                const size_t reserve = (size_t)256 << 20;
+                if (g.cache_limit && cudaMemGetInfo(&fr, &tot) == cudaSuccess) {
+                    const size_t room = fr > reserve ? fr - reserve : 0;
+                    if (g.cache_limit > room) {
+                        fprintf(stderr, "waste: WASTE_CUDA_CACHE_MB lowered to %zu MB (%zu MB free on the device)\n",
+                                room >> 20, fr >> 20);
+                        g.cache_limit = room;
+                    }
+                }
+                const char *st = getenv("WASTE_CUDA_STATS");
+                if (st && strcmp(st, "0")) atexit(cu_stats);
                 g.ready = 1;
             }
         }
@@ -274,6 +307,6 @@ void waste_cuda_release_host_buffers(void)
 {
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g.ncache; i++) cudaFree(g.cache[i].dev);
-    g.ncache = 0; g.cache_bytes = 0;
+    g.ncache = 0; g.cache_bytes = 0; g.cache_full = 0;
     pthread_mutex_unlock(&g_mu);
 }

@@ -219,8 +219,12 @@ src/cuda.pic.o: src/cuda.cu src/waste_backend.h src/simd.h
 test_cuda$(EXE): tests/test_cuda.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-cuda-check: test_cuda$(EXE)
+# Then a whole forward pass with the device floor at 0 against the CPU
+# (tests/cuda_forward.sh). The kernel test alone left a gap: `make check`
+# with CUDA built in passed while every matvec in it stayed on the CPU.
+cuda-check: test_cuda$(EXE) test_forward$(EXE) waste$(EXE)
 	./test_cuda$(EXE)
+	tests/cuda_forward.sh
 
 src/metal.o: src/metal.m
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
