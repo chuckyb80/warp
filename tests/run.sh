@@ -235,6 +235,36 @@ else
     exit 1
 fi
 
+# The version is spelled twice in src/waste.h: three numeric macros and a
+# string, and nothing compared them. 0.8.2 bumped WASTE_VERSION_PATCH and
+# left WASTE_VERSION_STRING at "0.8.1", so `waste --version`, the server's
+# banner and the line at the top of this very run would all have said 0.8.1
+# on a 0.8.2 build — src/version.c reads the string — and the whole suite
+# stayed green, because nothing here reads a version at all. It is one grep.
+v_major=$(sed -n 's/^#define WASTE_VERSION_MAJOR *\([0-9][0-9]*\).*/\1/p' src/waste.h)
+v_minor=$(sed -n 's/^#define WASTE_VERSION_MINOR *\([0-9][0-9]*\).*/\1/p' src/waste.h)
+v_patch=$(sed -n 's/^#define WASTE_VERSION_PATCH *\([0-9][0-9]*\).*/\1/p' src/waste.h)
+v_str=$(sed -n 's/^#define WASTE_VERSION_STRING *"\([^"]*\)".*/\1/p' src/waste.h)
+v_want="$v_major.$v_minor.$v_patch"
+if [ -z "$v_major" ] || [ -z "$v_minor" ] || [ -z "$v_patch" ] || [ -z "$v_str" ]; then
+    no "src/waste.h version macros could not be read (got '$v_want' and '$v_str')"
+elif [ "$v_str" = "$v_want" ]; then
+    ok "WASTE_VERSION_STRING agrees with the numeric macros ($v_want)"
+else
+    no "WASTE_VERSION_STRING is \"$v_str\" but the macros say $v_want"
+fi
+
+# And the rule in CLAUDE.md: the changelog is written in the commit that
+# bumps the version, not in a later one. A release whose changelog lands
+# afterwards is a release nobody can read from the outside.
+if [ ! -f CHANGELOG.md ]; then
+    no "CHANGELOG.md is missing"
+elif grep -q "^## $v_want" CHANGELOG.md; then
+    ok "CHANGELOG.md has a section for $v_want"
+else
+    no "CHANGELOG.md has no '## $v_want' section; the changelog is written in the commit that bumps the version"
+fi
+
 head_ "model-container ownership"
 # This intentionally opens two contexts at once. Always give it a tiny
 # dedicated container rather than duplicating a caller-supplied K3 load.
@@ -1695,9 +1725,52 @@ else
         no "QSA block pooling is wrong (3 tok: '$q3'; 4 tok: '$q4')"
     fi
 
+    # A Qwen load picks the i8mm trunk kernel. That choice must stay on the
+    # model that made it: a non-Qwen context already open in this process
+    # keeps its own kernel and its own logits (#68).
+    WASTE_CACHE_MB=512 ./test_kernel_isolation "$MODEL" "$QWENC" >"$TMP/kiso.log" 2>&1
+    kiso_rc=$?
+    if [ "$kiso_rc" -eq 0 ]; then
+        ok "a Qwen load leaves an open non-Qwen model's kernel and logits alone"
+    elif [ "$kiso_rc" -eq 2 ]; then
+        sk "a Qwen load leaves an open non-Qwen model's kernel and logits alone" \
+           "$(tail -1 "$TMP/kiso.log")"
+    else
+        no "a Qwen load leaves an open non-Qwen model's kernel and logits alone"
+        tail -5 "$TMP/kiso.log"
+    fi
+
+    # kernel_kl is only meaningful if the two arms really are two kernels.
+    # When it set the kernel process-wide, the second load overwrote the
+    # first and it compared a kernel against itself: KL came out exactly
+    # 0.00e+00, which reads as "the kernels agree perfectly" — a passing
+    # number for a tool that had stopped measuring anything. A zero here is
+    # therefore not a strong result, it is the signature of that bug.
+    #
+    # Gated on kiso_rc 0, which is exactly the condition "this CPU selected
+    # TK_I8MM", i.e. a second kernel exists to compare against. On a CPU
+    # without i8mm, kern_clamp() folds k2 onto another arm and a zero would
+    # be honest rather than broken.
+    if [ "$kiso_rc" -eq 0 ] && [ -x ./kernel_kl ]; then
+        printf '3 7 11 5 9 13 2 17 4 8 19 23 6 29 12 31\n' >"$TMP/kkl_ids.txt"
+        kkl=$(./kernel_kl "$QWENC" "$TMP/kkl_ids.txt" 0 0 2 2>&1 | grep '^everything')
+        kkl_mean=$(printf '%s' "$kkl" | sed -n 's/.*KL mean \([0-9.e+-]*\).*/\1/p')
+        # Any nonzero mean is enough: the arms are distinct. The magnitude
+        # is fixture-dependent and deliberately not asserted.
+        if [ -n "$kkl_mean" ] && awk -v v="$kkl_mean" 'BEGIN{exit !(v+0>0)}'; then
+            ok "kernel_kl compares two distinct kernels (KL mean $kkl_mean)"
+        else
+            no "kernel_kl reported KL mean '$kkl_mean' between k0 and k2 — a zero means both arms ran the same kernel, not that the kernels agree (#68)"
+            printf '%s\n' "$kkl"
+        fi
+    elif [ "$kiso_rc" -eq 0 ]; then
+        sk "kernel_kl compares two distinct kernels" "kernel_kl not built"
+    fi
+
     # Chunked prefill against sequential decode, the check that has caught
     # every state bug in this engine: the two share no code above the layer
     # loop and must agree bit for bit.
+
     WASTE_CHUNK=1 ./test_forward "$QWENC" 3,7,11 "$TMP/qwen_chunk.bin" 0 \
         >/dev/null 2>&1
     if [ ! -s "$TMP/qwen_chunk.bin" ]; then
