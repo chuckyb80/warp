@@ -228,6 +228,10 @@ const char *waste_backend_name(void)
 
 void waste_backend_release_host_buffers(void)
 {
+#if defined(WASTE_ENABLE_CUDA)
+    extern void waste_cuda_release_host_buffers(void);
+    waste_cuda_release_host_buffers();
+#endif
 #if defined(WASTE_ENABLE_METAL)
     extern void waste_metal_release_host_buffers(void);
     waste_metal_release_host_buffers();

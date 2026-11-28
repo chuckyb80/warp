@@ -183,9 +183,20 @@ $(error WASTE_ENABLE_CUDA=1, but src/cuda.cu does not exist — the CUDA \
 backend is not implemented. Build without the flag: CPU+NEON is the \
 default, and Metal is the only accelerator this engine has)
 endif
+# nvcc builds the one .cu file; everything else stays on $(CC). The arch
+# defaults to the GPU in this machine (needs nvcc 11.5+); a build host
+# without one sets NVCC_ARCH, e.g. NVCC_ARCH=sm_86 for an RTX 30-series.
+CUDA_HOME ?= /usr/local/cuda
+NVCC      ?= $(CUDA_HOME)/bin/nvcc
+ifeq (,$(shell command -v $(NVCC) 2>/dev/null))
+$(error WASTE_ENABLE_CUDA=1, but nvcc was not found at $(NVCC) — install the \
+CUDA toolkit or set CUDA_HOME / NVCC. Build without the flag for CPU only)
+endif
+NVCC_ARCH ?= native
+NVCCFLAGS ?= -O3 -std=c++17 -arch=$(NVCC_ARCH)
 CFLAGS += -DWASTE_ENABLE_CUDA=1
-SRC    += src/cuda.cu
-LDLIBS += -lcudart
+CUSRC  := src/cuda.cu
+LDLIBS += -L$(CUDA_HOME)/lib64 -lcudart -lstdc++
 endif
 ifdef WASTE_ENABLE_BLAS
 ifeq (,$(wildcard src/blas.c))
@@ -198,7 +209,26 @@ SRC    += src/blas.c
 LDLIBS += -lblas
 endif
 
-OBJ := $(SRC:.c=.o) $(OBJCSRC:.m=.o)
+OBJ := $(SRC:.c=.o) $(OBJCSRC:.m=.o) $(CUSRC:.cu=.o)
+
+src/cuda.o: src/cuda.cu src/waste_backend.h src/simd.h
+	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
+
+src/cuda.pic.o: src/cuda.cu src/waste_backend.h src/simd.h
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -Isrc -c -o $@ $<
+
+# The CUDA backend's own check: the device kernel against the CPU one on
+# every bit width and a ragged last group, plus a timing. Not in TESTNAMES,
+# because a build without WASTE_ENABLE_CUDA has nothing to test.
+test_cuda$(EXE): tests/test_cuda.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Then a whole forward pass with the device floor at 0 against the CPU
+# (tests/cuda_forward.sh). The kernel test alone left a gap: `make check`
+# with CUDA built in passed while every matvec in it stayed on the CPU.
+cuda-check: test_cuda$(EXE) test_forward$(EXE) waste$(EXE)
+	./test_cuda$(EXE)
+	tests/cuda_forward.sh
 
 src/metal.o: src/metal.m
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
@@ -237,7 +267,7 @@ libwaste.a: $(OBJ)
 # than through a second copy of the engine in Python. Built from its own
 # objects because -fPIC is not in CFLAGS for the static path: mixing a
 # non-PIC libwaste.a into a shared object fails to link on Linux.
-SHOBJ := $(SRC:.c=.pic.o) $(OBJCSRC:.m=.pic.o)
+SHOBJ := $(SRC:.c=.pic.o) $(OBJCSRC:.m=.pic.o) $(CUSRC:.cu=.pic.o)
 
 %.pic.o: %.c
 	$(CC) $(CFLAGS) $(PICFLAG) -c -o $@ $<
@@ -388,4 +418,4 @@ fuzz-asan:
 	    $(PY) tools/fuzz_container.py --runs $(FUZZ_RUNS) || rc=$$?; \
 	 $(MAKE) --no-print-directory clean; exit $$rc
 
-.PHONY: all test check serve-check clean asan fuzz fuzz-asan
+.PHONY: all test check serve-check clean asan fuzz fuzz-asan cuda-check
