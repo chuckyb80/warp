@@ -275,7 +275,7 @@ jobs:
       # early with an explanation, not at link time on an undefined symbol.
       - name: Unimplemented backends refuse to build
         run: |
-          for flag in WASTE_ENABLE_CUDA WASTE_ENABLE_BLAS; do
+          for flag in WASTE_ENABLE_BLAS; do
             if make "$flag=1" 2>&1 | grep -q "is not implemented"; then
               echo "ok: $flag stops with a message"
             else
@@ -283,6 +283,17 @@ jobs:
             fi
             make clean >/dev/null
           done
+
+      # CUDA is implemented in this fork (src/cuda.cu); on a runner with no
+      # toolkit the flag must still stop early with a message, not at nvcc.
+      - name: CUDA without a toolkit refuses to build
+        run: |
+          if make WASTE_ENABLE_CUDA=1 NVCC=/nonexistent/nvcc 2>&1 | grep -q "nvcc was not found"; then
+            echo "ok: WASTE_ENABLE_CUDA stops with a message when nvcc is missing"
+          else
+            echo "FAIL: WASTE_ENABLE_CUDA without nvcc did not refuse cleanly"; exit 1
+          fi
+          make clean >/dev/null
 
       # diskbench.c has no Makefile rule and was compiled by no job on any
       # platform, so nothing noticed that it did not build for Windows at

@@ -188,6 +188,10 @@ endif
 # without one sets NVCC_ARCH, e.g. NVCC_ARCH=sm_86 for an RTX 30-series.
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
+ifeq (,$(shell command -v $(NVCC) 2>/dev/null))
+$(error WASTE_ENABLE_CUDA=1, but nvcc was not found at $(NVCC) — install the \
+CUDA toolkit or set CUDA_HOME / NVCC. Build without the flag for CPU only)
+endif
 NVCC_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(NVCC_ARCH)
 CFLAGS += -DWASTE_ENABLE_CUDA=1
